@@ -2,9 +2,8 @@ use crate::{
     mask::{Integers, Mask, MaskedModel},
     model::Model,
 };
-use bincode;
 use futures::ready;
-use rusoto_core::{Region, RusotoError};
+use rusoto_core::{credential::ProvideAwsCredentials, HttpClient, Region, RusotoError};
 use rusoto_s3::{
     CreateBucketError,
     CreateBucketOutput,
@@ -72,7 +71,7 @@ impl Buckets {
     }
 
     fn names(&self) -> impl Iterator<Item = &&str> {
-        self.0.values().into_iter()
+        self.0.values()
     }
 }
 
@@ -96,9 +95,13 @@ impl S3Store {
     ///
     /// let store = S3Store::new(region);
     /// ```
-    pub fn new(region: Region) -> Self {
+    pub fn new<P>(region: Region, credentials_provider: P) -> Self
+    where
+        P: ProvideAwsCredentials + Send + Sync + 'static,
+    {
+        let dispatcher = HttpClient::new().expect("failed to create request dispatcher");
         Self {
-            s3_client: S3Client::new(region),
+            s3_client: S3Client::new_with(dispatcher, credentials_provider, region),
             buckets: Buckets::new(),
         }
     }
@@ -270,10 +273,7 @@ impl S3Store {
     /// Delete all objects in all [`Buckets`].
     pub async fn clear_all(&self) -> Result<(), StorageError> {
         for bucket in self.buckets.names() {
-            let _ = self
-                .clear_bucket(bucket)
-                .await
-                .map_err(|_| StorageError::S3Error)?;
+            let _ = self.clear_bucket(bucket).await?;
         }
         Ok(())
     }
@@ -283,7 +283,8 @@ impl S3Store {
         for bucket in self.buckets.names() {
             let resp = self.create_bucket(bucket).await;
 
-            if let Err(RusotoError::Service(CreateBucketError::BucketAlreadyExists(_)))
+            if let Ok(_)
+            | Err(RusotoError::Service(CreateBucketError::BucketAlreadyExists(_)))
             | Err(RusotoError::Service(CreateBucketError::BucketAlreadyOwnedByYou(_))) = resp
             {
                 continue;
@@ -391,7 +392,7 @@ impl S3Store {
     ) -> Option<Vec<ObjectIdentifier>> {
         if let Some(objects) = &list_obj_resp.contents {
             let keys = objects
-                .into_iter()
+                .iter()
                 .filter_map(|obj| obj.key.clone())
                 .map(|key| ObjectIdentifier {
                     key,
@@ -482,7 +483,7 @@ impl ListObjectsStream {
         Self {
             s3_client: s3_client.clone(),
             bucket: bucket.clone(),
-            max_keys: max_keys,
+            max_keys,
             list_object_ids_future: Some(ListObjectIdentifierFuture::new(
                 s3_client, bucket, None, max_keys,
             )),
@@ -515,9 +516,9 @@ impl ListObjectsStream {
                         self.max_keys,
                     )
                 });
-                return Poll::Ready(object_identifiers);
+                Poll::Ready(object_identifiers)
             }
-            Err(()) => return Poll::Ready(None),
+            Err(()) => Poll::Ready(None),
         }
     }
 }
@@ -598,7 +599,7 @@ mod tests {
     use num::{bigint::BigUint, traits::identities::Zero};
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha20Rng;
-    use rusoto_core::Region;
+    use rusoto_core::{credential::StaticProvider, Region};
     use sodiumoxide::randombytes::randombytes;
     use std::{convert::TryFrom, iter, time::Instant};
     use tokio::task::JoinHandle;
@@ -649,27 +650,32 @@ mod tests {
         )
     }
 
-    fn create_minio_setup() -> Region {
-        Region::Custom {
-            name: String::from("eu-east-3"),
-            endpoint: String::from("http://127.0.0.1:9000"),
-        }
+    fn create_minio_setup() -> (Region, StaticProvider) {
+        (
+            Region::Custom {
+                name: String::from("eu-east-3"),
+                endpoint: ::std::env::var("TEST_S3_URL")
+                    .unwrap_or(String::from("http://localhost:9000")),
+            },
+            StaticProvider::new(String::from("minio"), String::from("minio123"), None, None),
+        )
     }
 
     async fn create_client() -> S3Store {
-        let region = create_minio_setup();
-        let s3_store = S3Store::new(region);
-        s3_store.clear_all().await.unwrap();
+        let (region, credential) = create_minio_setup();
+        let s3_store = S3Store::new(region, credential);
         s3_store.create_buckets().await.unwrap();
+        s3_store.clear_all().await.unwrap();
         s3_store
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_upload_download_global_model() {
         let s3_store = create_client().await;
 
-        for _ in 0..1100 {
-            let (key, global_model) = create_global_model(1000);
+        for _ in 0..10 {
+            let (key, global_model) = create_global_model(10);
             s3_store
                 .upload_global_model(&key, &global_model)
                 .await
@@ -683,11 +689,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_stream_masked_models() {
         let s3_store = create_client().await;
 
-        for _ in 0..35 {
-            let (key, masked_model) = create_masked_model(1_000_000);
+        for _ in 0..5 {
+            let (key, masked_model) = create_masked_model(10);
             s3_store
                 .upload_masked_model(&key, &masked_model)
                 .await
