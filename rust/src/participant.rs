@@ -30,9 +30,9 @@ use crate::{
     SumParticipantEphemeralSecretKey,
 };
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 /// Tasks of a participant.
-enum Task {
+pub enum Task {
     Sum,
     Update,
     None,
@@ -51,7 +51,7 @@ pub struct Participant {
     update_signature: ParticipantTaskSignature, // 64 bytes
 
     // round parameters
-    task: Task,
+    pub(crate) task: Task,
 }
 
 impl Default for Participant {
